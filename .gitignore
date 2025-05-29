@@ -46,6 +46,7 @@ coverage.xml
 *.spec
 dist/
 build/
+.idea/
 *.exe
 
 # Pyre type checker
