@@ -73,6 +73,45 @@ def check_libraries_loaded():
     return True
 
 
+def ask_folder_name(default_name):
+    top = tk.Toplevel(root)
+    top.title("Choose Output Folder Name")
+    top.geometry("400x150")
+    top.transient(root)
+    top.grab_set()
+    top.focus_force()
+
+    # Center the window on the screen
+    top.update_idletasks()
+    screen_w = top.winfo_screenwidth()
+    screen_h = top.winfo_screenheight()
+    win_w = 400
+    win_h = 150
+    x = (screen_w - win_w) // 2
+    y = (screen_h - win_h) // 2
+    top.geometry(f"{win_w}x{win_h}+{x}+{y}")
+
+    tk.Label(top, text="Enter name for output folder. \n"
+                       "The folder will be saved in the same location of the PDF file").pack(pady=10)
+    entry = tk.Entry(top, width=40)
+    entry.insert(0, default_name)
+    entry.pack()
+
+    result = {"name": None}
+
+    def on_ok(event=None):
+        result["name"] = entry.get().strip()
+        top.destroy()
+
+    tk.Button(top, text="OK", command=on_ok).pack(pady=10)
+
+    entry.bind("<Return>", on_ok)
+    entry.focus()
+
+    root.wait_window(top)
+    return result["name"]
+
+
 # =============================================================================
 # PDF PROCESSING FUNCTIONS
 # =============================================================================
@@ -314,12 +353,14 @@ def split_pdf():
             return
 
     # Choose output directory
-    output_folder = filedialog.askdirectory(
-        title="Choose folder to save split PDFs"
-    )
-
-    if not output_folder:  # User cancelled
+    default_name = os.path.splitext(os.path.basename(pdf_path))[0] + "_split"
+    folder_name = ask_folder_name(default_name)
+    if not folder_name:
         return
+
+    pdf_dir = os.path.dirname(pdf_path)
+    output_folder = os.path.join(pdf_dir, folder_name)
+    os.makedirs(output_folder, exist_ok=True)
 
     # Perform the splitting operation
     individual_outputs, combined_output = split_pdf_with_combined_output(pdf_path, page_numbers, output_folder)
@@ -355,13 +396,13 @@ def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder):
     merged_pdf = fitz.open()  # For combined output
 
     # Process each page range pair
+    # Process non-overlapping page range pairs
     for i in range(0, len(page_ranges), 2):
         start, end = page_ranges[i], page_ranges[i + 1]
         new_pdf = fitz.open()
 
-        # Copy pages for this range
-        for page_num in range(start - 1, end):  # Convert to 0-based index
-            new_pdf.insert_pdf(pdf_document, from_page=page_num, to_page=page_num)
+        # Copy the full range in one call
+        new_pdf.insert_pdf(pdf_document, from_page=start - 1, to_page=end - 1)
 
         # Save individual split file
         output_path = os.path.join(output_folder, f"{base_name}_{start}-{end}.pdf")
@@ -373,12 +414,11 @@ def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder):
         to_merge = fitz.open(output_path)
         merged_pdf.insert_pdf(to_merge)
 
-        # Add blank page if this section has even number of pages
-        # This ensures proper printing alignment
-        if (end - start) % 2 == 0:  # If even number of pages in range
+        # Add blank page if number of pages in section is odd
+        if (end - start + 1) % 2 != 0:
             blank = merged_pdf.new_page(width=to_merge[0].rect.width,
                                         height=to_merge[0].rect.height)
-            blank.draw_rect(blank.rect)  # Optional visual border for blank page
+            blank.draw_rect(blank.rect)  # Optional: border for blank page
 
         to_merge.close()
 
@@ -552,7 +592,7 @@ def convert_word_to_pdf():
 
 # Create main window with modern styling
 root = tk.Tk()
-root.title("PDF Rescaler v2.0")
+root.title("🔥THE ULTIMATE PDF TOOL 3000💥")
 root.geometry("750x950")
 root.resizable(True, True)
 
