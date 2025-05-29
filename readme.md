@@ -111,8 +111,8 @@ This section contains tools for splitting, merging, and converting files.
 
 ## Author
 
-This tool was developed by Fabuchi.
+This tool was developed by Lorenzo Liverani (and a lot of different AI tools).
 
 ## License
 
-This project is open-source and available under the MIT License.
+This project is open-source and available to everyone
