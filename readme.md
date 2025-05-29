@@ -1,4 +1,4 @@
-# PDF Rescaler v2.0 - A Comprehensive PDF Processing Tool
+# THE ULTIMATE PDF TOOL 3000 - A Comprehensive PDF Processing Tool
 
 PDF Rescaler v2.0 is a versatile Python application built with `tkinter` that provides a user-friendly graphical interface for various PDF manipulation tasks. It includes features for zooming/scaling PDF content, splitting PDFs into multiple parts, merging multiple PDFs, and converting Word documents (.docx) to PDF format.
 
