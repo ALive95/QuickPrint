@@ -8,8 +8,8 @@ A Python desktop application for PDF manipulation and Word-to-PDF conversion, bu
 - **PDF Splitting**: split a single PDF into multiple files by page range; also produces a combined file with blank pages inserted for even duplex page counts
 - **PDF Merging**: combine multiple PDFs into one, with automatic blank page insertion for duplex printing alignment
 - **Resize to A4**: fit any PDF page to standard A4 dimensions
-- **Word to PDF**: convert `.docx` files to PDF using Microsoft Word (Windows) or LibreOffice (macOS/Linux)
-- **Background library loading**: heavy libraries load in a background thread so the UI is immediately responsive
+- **Word to PDF**: convert `.docx` files to PDF using Microsoft Word (Windows and macOS)
+- **Loading screen and progress bar**: libraries load behind a splash screen; every operation shows a progress bar with the current step and elapsed time
 
 ## Requirements
 
@@ -20,10 +20,10 @@ A Python desktop application for PDF manipulation and Word-to-PDF conversion, bu
 - `tkinter` (included in the Python standard library)
 
 ```bash
-pip install PyMuPDF docx2pdf pywin32
+pip install -r requirements.txt
 ```
 
-**Note**: Word-to-PDF conversion requires Microsoft Word on Windows, or LibreOffice on macOS/Linux.
+**Note**: Word-to-PDF conversion requires Microsoft Word (Windows or macOS). The PDF features work without it.
 
 ## Running the app
 
@@ -31,14 +31,36 @@ pip install PyMuPDF docx2pdf pywin32
 python MAIN.py
 ```
 
-## Building the exe (Windows)
+## Building the app
 
-```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --icon=your_icon.ico MAIN.py
+### Windows and macOS, automatically (GitHub Actions)
+
+Every push to `main` builds the app on GitHub's machines ([.github/workflows/build.yml](.github/workflows/build.yml)):
+
+- `QuickPrint-Windows`: `QuickPrint.exe`
+- `QuickPrint-macOS-AppleSilicon`: for Macs with M1 or newer
+- `QuickPrint-macOS-Intel`: for older Intel Macs
+
+Download them from the **Actions** tab (open a run, then **Artifacts**; requires a GitHub login).
+To publish a public download, push a version tag: `git tag v2.1 && git push origin v2.1`. The builds then appear under **Releases**.
+
+### Windows, locally
+
+Close the app, then run [build.ps1](build.ps1) (uses the `MyEnv` conda environment):
+
+```powershell
+.uild.ps1
 ```
 
 The executable will be in the `dist/` folder.
+
+### Opening the app on macOS
+
+The app is not signed with an Apple developer account, so the first time macOS says it cannot be verified:
+
+1. Unzip, and move `QuickPrint.app` to Applications
+2. Right-click it, choose **Open**, then **Open** again (or: *System Settings -> Privacy & Security -> Open Anyway*)
+3. On the first Word conversion, allow QuickPrint to control Microsoft Word, and grant Word access to the files if asked
 
 ## Usage
 
@@ -71,14 +93,14 @@ Select a mode and click **Process PDFs**:
 
 Clears the current file selection.
 
-### 6. Log
+### 6. Status
 
-Real-time status messages for all operations. Green = success, red = error, blue = info. Click **Clear Log** to reset.
+The progress bar shows the current operation, its step and the elapsed time. Click **Show details** for the full log (green = success, red = error, blue = info); it opens automatically when an error occurs. Click **Clear Log** to reset.
 
 ## Troubleshooting
 
 - **"Libraries are still loading"**: wait a moment after launch before processing files
-- **Word to PDF fails**: make sure Word (Windows) or LibreOffice (macOS/Linux) is installed; try closing all Word instances and/or running as administrator
+- **Word to PDF fails**: make sure Microsoft Word is installed; on Windows try closing all Word instances and/or running as administrator; on macOS check *System Settings -> Privacy & Security -> Automation* allows QuickPrint to control Word
 
 ## Author
 

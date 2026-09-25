@@ -21,6 +21,8 @@ import threading
 # GLOBALS
 # =============================================================================
 
+IS_MAC = sys.platform == "darwin"
+
 libraries_loaded = False
 fitz = None
 convert_func = None
@@ -72,7 +74,11 @@ def log_status(message, color="green"):
 # PROGRESS BAR
 # =============================================================================
 
-TIMINGS_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "QuickPrint", "timings.json")
+if IS_MAC:
+    _settings_dir = os.path.expanduser("~/Library/Application Support")
+else:
+    _settings_dir = os.environ.get("APPDATA", os.path.expanduser("~"))
+TIMINGS_FILE = os.path.join(_settings_dir, "QuickPrint", "timings.json")
 
 
 def load_timings():
@@ -637,18 +643,19 @@ def convert_word_to_pdf():
                     convert_func(safe_docx, safe_pdf)
                     shutil.move(safe_pdf, final_output)
                     success = True
-                except Exception as e1:
-                    errors.append(f"Method 1: {e1}")
+                # SystemExit: on macOS docx2pdf calls sys.exit(1) when Word reports an error
+                except (Exception, SystemExit) as e1:
+                    errors.append(f"Method 1: {e1!r}")
 
                 if not success:
                     try:
                         convert_func(safe_docx, tmp)
                         shutil.move(safe_pdf, final_output)
                         success = True
-                    except Exception as e2:
-                        errors.append(f"Method 2: {e2}")
+                    except (Exception, SystemExit) as e2:
+                        errors.append(f"Method 2: {e2!r}")
 
-                if not success:
+                if not success and not IS_MAC:  # COM retry is Windows-only
                     try:
                         import pythoncom
                         pythoncom.CoInitialize()
@@ -658,8 +665,8 @@ def convert_word_to_pdf():
                             success = True
                         finally:
                             pythoncom.CoUninitialize()
-                    except Exception as e3:
-                        errors.append(f"Method 3 (COM): {e3}")
+                    except (Exception, SystemExit) as e3:
+                        errors.append(f"Method 3 (COM): {e3!r}")
 
             # Only successful conversions teach the time estimate
             progress.advance(record=success)
@@ -669,7 +676,9 @@ def convert_word_to_pdf():
                 failed += 1
                 root.after(0, log_status, f"Failed: {os.path.basename(docx_path)}\n", "red")
                 root.after(0, log_status, f"  Last error: {errors[-1]}\n", "red")
-                root.after(0, log_status, "  Try: close Word, run as admin, or check docx2pdf install\n", "blue")
+                hint = ("make sure Microsoft Word is installed and allow access if macOS asks" if IS_MAC
+                        else "close Word, run as admin, or check docx2pdf install")
+                root.after(0, log_status, f"  Try: {hint}\n", "blue")
 
         finish_task(total, failed, "converted")
 
@@ -700,10 +709,21 @@ SUCCESS     = "#2e7d32"
 ERROR       = "#c0392b"
 INFO        = "#1565c0"
 
-FONT_UI     = ("Segoe UI", 10)
-FONT_LABEL  = ("Segoe UI", 9)
-FONT_TITLE  = ("Segoe UI Semibold", 10)
-FONT_MONO   = ("Consolas", 9)
+if IS_MAC:
+    # Tk on macOS renders points smaller than Windows, hence the bigger sizes
+    FONT_UI     = ("Helvetica Neue", 13)
+    FONT_LABEL  = ("Helvetica Neue", 12)
+    FONT_TITLE  = ("Helvetica Neue", 13, "bold")
+    FONT_MONO   = ("Menlo", 11)
+    FONT_EMOJI  = "Apple Color Emoji"
+    FONT_BIG    = ("Helvetica Neue", "bold")      # app name: (family, weight)
+else:
+    FONT_UI     = ("Segoe UI", 10)
+    FONT_LABEL  = ("Segoe UI", 9)
+    FONT_TITLE  = ("Segoe UI Semibold", 10)
+    FONT_MONO   = ("Consolas", 9)
+    FONT_EMOJI  = "Segoe UI Emoji"
+    FONT_BIG    = ("Segoe UI Black", "bold")
 
 root = tk.Tk()
 root.withdraw()  # hidden until the splash screen has finished loading
@@ -742,7 +762,7 @@ style.map("Card.TLabelframe", bordercolor=[("focus", ACCENT)])
 # Primary accent button
 style.configure("Accent.TButton",
     background=ACCENT, foreground="#ffffff",
-    font=("Segoe UI Semibold", 10),
+    font=FONT_TITLE,
     relief="flat", borderwidth=0,
     padding=(10, 7))
 style.map("Accent.TButton",
@@ -806,10 +826,10 @@ header.columnconfigure(0, weight=1)
 header_inner = tk.Frame(header, bg=BG)
 header_inner.pack(anchor="center")
 
-tk.Label(header_inner, text="🔥", bg=BG, font=("Segoe UI Emoji", 22)).pack(side="left")
+tk.Label(header_inner, text="🔥", bg=BG, font=(FONT_EMOJI, 22)).pack(side="left")
 tk.Label(header_inner, text=" The Ultimate PDF Tool 3000 ", bg=BG, fg=ACCENT,
-         font=("Segoe UI Black", 22, "bold")).pack(side="left")
-tk.Label(header_inner, text="💥", bg=BG, font=("Segoe UI Emoji", 22)).pack(side="left")
+         font=(FONT_BIG[0], 22, FONT_BIG[1])).pack(side="left")
+tk.Label(header_inner, text="💥", bg=BG, font=(FONT_EMOJI, 22)).pack(side="left")
 
 # --- File Selection ---
 file_frame = ttk.LabelFrame(main_frame, text="DOCUMENTS", style="Card.TLabelframe", padding=14)
@@ -990,10 +1010,10 @@ def show_splash():
 
     title = tk.Frame(splash, bg=BG)
     title.pack(padx=40, pady=(32, 22))
-    tk.Label(title, text="🔥", bg=BG, font=("Segoe UI Emoji", 20)).pack(side="left")
+    tk.Label(title, text="🔥", bg=BG, font=(FONT_EMOJI, 20)).pack(side="left")
     tk.Label(title, text=" The Ultimate PDF Tool 3000 ", bg=BG, fg=ACCENT,
-             font=("Segoe UI Black", 20, "bold")).pack(side="left")
-    tk.Label(title, text="💥", bg=BG, font=("Segoe UI Emoji", 20)).pack(side="left")
+             font=(FONT_BIG[0], 20, FONT_BIG[1])).pack(side="left")
+    tk.Label(title, text="💥", bg=BG, font=(FONT_EMOJI, 20)).pack(side="left")
 
     bar = ttk.Progressbar(splash, orient="horizontal", mode="determinate", maximum=1000,
                           style="Accent.Horizontal.TProgressbar")

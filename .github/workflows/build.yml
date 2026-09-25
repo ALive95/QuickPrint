@@ -1,0 +1,92 @@
+# Builds QuickPrint for Windows and macOS on GitHub's machines.
+# - Every push to main: download the builds from the "Actions" tab (click the run -> Artifacts).
+# - Push a tag like v2.1 (git tag v2.1 && git push origin v2.1): the builds are also
+#   published as a GitHub Release, downloadable without logging in.
+name: Build apps
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:   # "Run workflow" button in the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: QuickPrint-Windows
+          - os: macos-latest        # Apple Silicon (M1 and newer)
+            artifact: QuickPrint-macOS-AppleSilicon
+          - os: macos-15-intel      # Intel Macs
+            artifact: QuickPrint-macOS-Intel
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+
+      # docx2pdf needs its convert.jxa script (macOS) and its package metadata at import time
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: >
+          pyinstaller --noconsole --onefile --noconfirm --name QuickPrint --icon your_icon.ico
+          --collect-data docx2pdf --copy-metadata docx2pdf MAIN.py
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --windowed --noconfirm --name QuickPrint --icon your_icon.ico \
+            --osx-bundle-identifier com.alive95.quickprint \
+            --collect-data docx2pdf --copy-metadata docx2pdf MAIN.py
+          # Without this key macOS silently blocks the app from controlling Word
+          plutil -insert NSAppleEventsUsageDescription \
+            -string "QuickPrint uses Microsoft Word to convert .docx files to PDF." \
+            dist/QuickPrint.app/Contents/Info.plist
+          # Editing Info.plist breaks the signature: re-sign (ad-hoc, no Apple account)
+          codesign --force --deep --sign - dist/QuickPrint.app
+          # ditto keeps the .app's permissions and symlinks intact
+          ditto -c -k --keepParent dist/QuickPrint.app ${{ matrix.artifact }}.zip
+
+      - name: Upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/QuickPrint.exe
+
+      - name: Upload (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Rename Windows exe
+        run: mv out/QuickPrint-Windows/QuickPrint.exe out/QuickPrint-Windows.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/QuickPrint-Windows.exe
+            out/QuickPrint-macOS-AppleSilicon/QuickPrint-macOS-AppleSilicon.zip
+            out/QuickPrint-macOS-Intel/QuickPrint-macOS-Intel.zip
