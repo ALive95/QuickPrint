@@ -1,6 +1,18 @@
 # PDF Rescaler v2.0 - PDF zooming, splitting, merging, and Word-to-PDF conversion
 
 import os
+import sys
+
+# In a windowed exe (PyInstaller --noconsole) stdout/stderr are None, which breaks
+# libraries that print progress (docx2pdf uses tqdm) -> redirect them to devnull.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+import json
+import math
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import threading
@@ -27,8 +39,11 @@ def preload_libraries():
         fitz = pymupdf_lib
         convert_func = docx_convert
         libraries_loaded = True
+        progress.advance()
+        progress.finish("Libraries loaded - Ready to process!", "green")
         root.after(0, log_status, "Libraries loaded - Ready to process!\n", "green")
     except Exception as e:
+        progress.finish("Error loading libraries - see details", "red")
         root.after(0, log_status, f"Error loading libraries: {e}\n", "red")
 
 
@@ -44,11 +59,139 @@ def check_libraries_loaded():
 # =============================================================================
 
 def log_status(message, color="green"):
-    """Thread-safe status log update."""
+    """Thread-safe status log update. Errors open the Details panel."""
+    if color == "red":
+        set_details_visible(True)
     status_text.config(state=tk.NORMAL)
     status_text.insert(tk.END, message, color)
     status_text.config(state=tk.DISABLED)
     status_text.yview(tk.END)
+
+
+# =============================================================================
+# PROGRESS BAR
+# =============================================================================
+
+TIMINGS_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "QuickPrint", "timings.json")
+
+
+def load_timings():
+    try:
+        with open(TIMINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_timings(timings):
+    try:
+        os.makedirs(os.path.dirname(TIMINGS_FILE), exist_ok=True)
+        with open(TIMINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(timings, f)
+    except Exception:
+        pass
+
+
+class ProgressTracker:
+    """Shared state for the progress bar. Worker threads only set fields here;
+    animate_progress() (Tk loop) reads them and draws the bar.
+
+    A task is split into `total` steps. Inside the current step the bar creeps
+    forward on an easing curve based on how long a step is expected to take, so it
+    keeps moving even during one long step (e.g. a single Word conversion). The
+    expected duration is learned from previous runs (per `key`) and saved to disk."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.timings = load_timings()
+        self.busy = False
+        self.finished = True
+        self.total = 1
+        self.done = 0
+        self.est = 1.0
+        self.key = None
+        self.task_started = self.step_started = self.task_ended = time.time()
+        self.message = "Idle"
+        self.color = "dim"
+
+    def start(self, total, message, key=None, default_est=0.3):
+        with self.lock:
+            now = time.time()
+            self.busy, self.finished = True, False
+            self.total = max(total, 1)
+            self.done = 0
+            self.key = key
+            self.est = self.timings.get(key, default_est) if key else default_est
+            self.task_started = self.step_started = now
+            self.message, self.color = message, "blue"
+
+    def advance(self, message=None, record=True):
+        """Mark the current step as done; `message` describes the next step."""
+        with self.lock:
+            now = time.time()
+            if self.key and record:
+                duration = now - self.step_started
+                old = self.timings.get(self.key)
+                self.timings[self.key] = duration if old is None else 0.6 * old + 0.4 * duration
+                self.est = self.timings[self.key]
+            self.done = min(self.done + 1, self.total)
+            self.step_started = now
+            if message:
+                self.message = message
+
+    def set_message(self, message):
+        with self.lock:
+            self.message = message
+
+    def finish(self, message, color="green"):
+        with self.lock:
+            self.done = self.total
+            self.busy, self.finished = False, True
+            self.task_ended = time.time()
+            self.message, self.color = message, color
+            if self.key:
+                save_timings(self.timings)
+
+    def reset(self, message):
+        """Empty bar, idle message."""
+        with self.lock:
+            self.busy, self.finished = False, True
+            self.done = 0
+            self.task_started = self.task_ended = time.time()
+            self.message, self.color = message, "dim"
+
+    def snapshot(self):
+        """Returns (fraction 0-1, message, color, elapsed seconds)."""
+        with self.lock:
+            now = time.time()
+            if self.finished:
+                return self.done / self.total, self.message, self.color, self.task_ended - self.task_started
+            # Real progress + eased guess inside the current step (never reaches the next step)
+            creep = 1 - math.exp(-(now - self.step_started) / max(self.est, 0.05))
+            fraction = (self.done + 0.95 * creep) / self.total
+            return fraction, self.message, self.color, now - self.task_started
+
+
+progress = ProgressTracker()
+
+
+def task_busy():
+    """True (and warn) if another operation is still running."""
+    if progress.busy:
+        messagebox.showinfo("Please Wait", "Another operation is still running.")
+        return True
+    return False
+
+
+def count_pages(files):
+    total = 0
+    for f in files:
+        try:
+            with fitz.open(f) as doc:
+                total += len(doc)
+        except Exception:
+            pass
+    return total
 
 
 # =============================================================================
@@ -108,10 +251,8 @@ def fabuchi_clip_rect(width, height):
     return fitz.Rect(width * 0.05, height * 0.05, width * 0.95, height * 0.95)
 
 
-def zoom_pdf_content(input_path, output_folder, scale_factor=None, fabuchi=False):
-    if not check_libraries_loaded():
-        return
-
+def zoom_pdf_content(input_path, output_folder, scale_factor=None, fabuchi=False, on_page=None):
+    """Returns True on success. `on_page` is called after each page."""
     os.makedirs(output_folder, exist_ok=True)
     name, ext = os.path.splitext(os.path.basename(input_path))
     suffix = "_fabuchi" if fabuchi else "_zoomed"
@@ -138,22 +279,29 @@ def zoom_pdf_content(input_path, output_folder, scale_factor=None, fabuchi=False
                 )
 
             new_page.show_pdf_page(clip_rect, pdf_document, page_num, keep_proportion=True)
+            if on_page:
+                on_page()
 
         new_pdf.save(output_path)
         pdf_document.close()
         new_pdf.close()
         root.after(0, log_status, f"Processed: {os.path.basename(output_path)}\n", "green")
+        return True
 
     except Exception as e:
         root.after(0, log_status, f"Error processing {input_path}: {e}\n", "red")
+        return False
 
 
 def process_pdfs():
+    if not check_libraries_loaded() or task_busy():
+        return
     if not selected_files:
         messagebox.showerror("Error", "No files selected!")
         return
     if not check_all_pdfs():
         return
+    pdf_files = [f for f in selected_files if f.lower().endswith(".pdf")]
 
     mode = mode_var.get()
 
@@ -173,15 +321,25 @@ def process_pdfs():
         return
 
     def run():
-        process_button.config(state=tk.DISABLED)
-        try:
-            for file in selected_files:
-                zoom_pdf_content(file, output_folder, scale_factor, fabuchi=(mode == "fabuchi"))
-            root.after(0, log_status, f"Processing complete! Files saved to: {output_folder}\n", "green")
-        finally:
-            root.after(0, lambda: process_button.config(state=tk.NORMAL))
+        progress.start(count_pages(pdf_files), "Reading PDFs...")
+        failed = 0
+        for i, file in enumerate(pdf_files, 1):
+            progress.set_message(f"Zooming {os.path.basename(file)}  ({i}/{len(pdf_files)})")
+            if not zoom_pdf_content(file, output_folder, scale_factor,
+                                    fabuchi=(mode == "fabuchi"), on_page=progress.advance):
+                failed += 1
+        root.after(0, log_status, f"Processing complete! Files saved to: {output_folder}\n", "green")
+        finish_task(len(pdf_files), failed, "processed")
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def finish_task(total, failed, verb):
+    """Final bar message for a multi-file task."""
+    if failed:
+        progress.finish(f"Done - {total - failed}/{total} file(s) {verb}, {failed} failed (see details)", "red")
+    else:
+        progress.finish(f"Done - {total} file(s) {verb}", "green")
 
 
 # =============================================================================
@@ -220,7 +378,7 @@ def ask_folder_name(default_name):
 
 
 def split_pdf():
-    if not check_libraries_loaded():
+    if not check_libraries_loaded() or task_busy():
         return
     if not selected_files:
         messagebox.showerror("Error", "No files selected!")
@@ -271,14 +429,24 @@ def split_pdf():
     output_folder = os.path.join(os.path.dirname(pdf_path), folder_name)
     os.makedirs(output_folder, exist_ok=True)
 
-    split_pdf_with_combined_output(pdf_path, page_numbers, output_folder)
-    log_status(f"PDF split successfully! Files saved to: {output_folder}\n", "green")
+    parts = len(page_numbers) // 2
+
+    def run():
+        # One step per part + one for the combined PDF
+        progress.start(parts + 1, f"Splitting {os.path.basename(pdf_path)}  (part 1/{parts})")
+        try:
+            split_pdf_with_combined_output(pdf_path, page_numbers, output_folder, on_step=progress.advance)
+            root.after(0, log_status, f"PDF split successfully! Files saved to: {output_folder}\n", "green")
+            progress.finish(f"Done - split into {parts} part(s)", "green")
+        except Exception as e:
+            root.after(0, log_status, f"Error splitting PDF: {e}\n", "red")
+            progress.finish("Split failed - see details", "red")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
-def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder):
-    if not check_libraries_loaded():
-        return
-
+def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder, on_step=None):
+    """`on_step(next_message)` is called after each part and after the combined PDF."""
     pdf_document = fitz.open(pdf_path)
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
     individual_outputs = []
@@ -302,10 +470,17 @@ def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder):
             blank.draw_rect(blank.rect)
         to_merge.close()
 
+        if on_step:
+            part, parts = i // 2 + 1, len(page_ranges) // 2
+            on_step(f"Splitting {base_name}  (part {part + 1}/{parts})" if part < parts
+                    else "Saving combined PDF...")
+
     merged_output_path = os.path.join(output_folder, f"{base_name}_merged.pdf")
     merged_pdf.save(merged_output_path)
     merged_pdf.close()
     pdf_document.close()
+    if on_step:
+        on_step()
 
     return individual_outputs, merged_output_path
 
@@ -315,13 +490,14 @@ def split_pdf_with_combined_output(pdf_path, page_ranges, output_folder):
 # =============================================================================
 
 def merge_selected_pdfs():
-    if not check_libraries_loaded():
+    if not check_libraries_loaded() or task_busy():
         return
     if not selected_files:
         messagebox.showerror("Error", "No files selected!")
         return
     if not check_all_pdfs():
         return
+    pdf_files = [f for f in selected_files if f.lower().endswith(".pdf")]
 
     output_path = filedialog.asksaveasfilename(
         title="Save Merged PDF As",
@@ -332,24 +508,34 @@ def merge_selected_pdfs():
     if not output_path:
         return
 
-    try:
-        merged = fitz.open()
-        for file in selected_files:
-            pdf = fitz.open(file)
-            merged.insert_pdf(pdf)
-            # Insert blank page if PDF has odd page count (for duplex printing)
-            if len(pdf) % 2 != 0:
-                rect = pdf[0].rect
-                blank = merged.new_page(width=rect.width, height=rect.height)
-                blank.draw_rect(blank.rect)
-            pdf.close()
+    def run():
+        n = len(pdf_files)
+        # One step per file + one for saving
+        progress.start(n + 1, f"Adding {os.path.basename(pdf_files[0])}  (1/{n})")
+        try:
+            merged = fitz.open()
+            for i, file in enumerate(pdf_files, 1):
+                pdf = fitz.open(file)
+                merged.insert_pdf(pdf)
+                # Insert blank page if PDF has odd page count (for duplex printing)
+                if len(pdf) % 2 != 0:
+                    rect = pdf[0].rect
+                    blank = merged.new_page(width=rect.width, height=rect.height)
+                    blank.draw_rect(blank.rect)
+                pdf.close()
+                progress.advance(f"Adding {os.path.basename(pdf_files[i])}  ({i + 1}/{n})" if i < n
+                                 else "Saving merged PDF...")
 
-        merged.save(output_path)
-        merged.close()
-        log_status(f"Merged PDFs saved as: {os.path.basename(output_path)}\n", "green")
+            merged.save(output_path)
+            merged.close()
+            root.after(0, log_status, f"Merged PDFs saved as: {os.path.basename(output_path)}\n", "green")
+            progress.finish(f"Done - {n} file(s) merged", "green")
 
-    except Exception as e:
-        log_status(f"Error merging PDFs: {e}\n", "red")
+        except Exception as e:
+            root.after(0, log_status, f"Error merging PDFs: {e}\n", "red")
+            progress.finish("Merge failed - see details", "red")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 # =============================================================================
@@ -357,13 +543,14 @@ def merge_selected_pdfs():
 # =============================================================================
 
 def resize_to_a4():
-    if not check_libraries_loaded():
+    if not check_libraries_loaded() or task_busy():
         return
     if not selected_files:
         messagebox.showerror("Error", "No files selected!")
         return
     if not check_all_pdfs():
         return
+    pdf_files = [f for f in selected_files if f.lower().endswith(".pdf")]
 
     output_folder = filedialog.askdirectory(title="Choose folder to save resized PDFs")
     if not output_folder:
@@ -371,24 +558,33 @@ def resize_to_a4():
 
     A4_WIDTH, A4_HEIGHT = 595, 842
 
-    for input_path in selected_files:
-        try:
-            pdf_document = fitz.open(input_path)
-            new_pdf = fitz.open()
+    def run():
+        progress.start(count_pages(pdf_files), "Reading PDFs...")
+        failed = 0
+        for i, input_path in enumerate(pdf_files, 1):
+            progress.set_message(f"Resizing {os.path.basename(input_path)}  ({i}/{len(pdf_files)})")
+            try:
+                pdf_document = fitz.open(input_path)
+                new_pdf = fitz.open()
 
-            for page_num in range(len(pdf_document)):
-                new_page = new_pdf.new_page(width=A4_WIDTH, height=A4_HEIGHT)
-                new_page.show_pdf_page(new_page.rect, pdf_document, page_num, keep_proportion=True)
+                for page_num in range(len(pdf_document)):
+                    new_page = new_pdf.new_page(width=A4_WIDTH, height=A4_HEIGHT)
+                    new_page.show_pdf_page(new_page.rect, pdf_document, page_num, keep_proportion=True)
+                    progress.advance()
 
-            name, ext = os.path.splitext(os.path.basename(input_path))
-            output_path = os.path.join(output_folder, f"{name}_a4{ext}")
-            new_pdf.save(output_path)
-            pdf_document.close()
-            new_pdf.close()
-            log_status(f"Resized: {os.path.basename(output_path)}\n", "green")
+                name, ext = os.path.splitext(os.path.basename(input_path))
+                output_path = os.path.join(output_folder, f"{name}_a4{ext}")
+                new_pdf.save(output_path)
+                pdf_document.close()
+                new_pdf.close()
+                root.after(0, log_status, f"Resized: {os.path.basename(output_path)}\n", "green")
 
-        except Exception as e:
-            log_status(f"Error resizing {os.path.basename(input_path)}: {e}\n", "red")
+            except Exception as e:
+                failed += 1
+                root.after(0, log_status, f"Error resizing {os.path.basename(input_path)}: {e}\n", "red")
+        finish_task(len(pdf_files), failed, "resized")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 # =============================================================================
@@ -396,7 +592,7 @@ def resize_to_a4():
 # =============================================================================
 
 def convert_word_to_pdf():
-    if not check_libraries_loaded():
+    if not check_libraries_loaded() or task_busy():
         return
     if not selected_files:
         messagebox.showerror("Error", "No files selected!")
@@ -411,49 +607,71 @@ def convert_word_to_pdf():
         return
 
     def run():
-        for docx_path in word_files:
+        import tempfile, shutil, unicodedata
+
+        def sanitize(name):
+            nfkd = unicodedata.normalize("NFKD", name)
+            return "".join(c if c.isascii() else "_" for c in nfkd)
+
+        total = len(word_files)
+        failed = 0
+        # Duration of one conversion is learned across runs ("docx" key)
+        progress.start(total, "", key="docx", default_est=8)
+
+        for i, docx_path in enumerate(word_files, 1):
             success = False
             errors = []
+            hint = "  - starting Word, first file is slower" if i == 1 else ""
+            progress.set_message(f"Converting {os.path.basename(docx_path)}  ({i}/{total}){hint}")
 
-            # Method 1: explicit output path
-            try:
-                output_path = os.path.join(
-                    output_folder,
-                    os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
-                )
-                convert_func(docx_path, output_path)
-                root.after(0, log_status, f"Converted: {os.path.basename(docx_path)}\n", "green")
-                success = True
-            except Exception as e1:
-                errors.append(f"Method 1: {e1}")
+            base = os.path.splitext(os.path.basename(docx_path))[0]
+            safe_base = sanitize(base)
+            final_output = os.path.join(output_folder, base + ".pdf")
 
-            # Method 2: folder only
-            if not success:
+            with tempfile.TemporaryDirectory() as tmp:
+                safe_docx = os.path.join(tmp, safe_base + ".docx")
+                safe_pdf  = os.path.join(tmp, safe_base + ".pdf")
+                shutil.copy2(docx_path, safe_docx)
+
                 try:
-                    convert_func(docx_path, output_folder)
-                    root.after(0, log_status, f"Converted: {os.path.basename(docx_path)}\n", "green")
+                    convert_func(safe_docx, safe_pdf)
+                    shutil.move(safe_pdf, final_output)
                     success = True
-                except Exception as e2:
-                    errors.append(f"Method 2: {e2}")
+                except Exception as e1:
+                    errors.append(f"Method 1: {e1}")
 
-            # Method 3: with COM re-init (Windows)
-            if not success:
-                try:
-                    import pythoncom
-                    pythoncom.CoInitialize()
+                if not success:
                     try:
-                        convert_func(docx_path, output_folder)
-                        root.after(0, log_status, f"Converted: {os.path.basename(docx_path)}\n", "green")
+                        convert_func(safe_docx, tmp)
+                        shutil.move(safe_pdf, final_output)
                         success = True
-                    finally:
-                        pythoncom.CoUninitialize()
-                except Exception as e3:
-                    errors.append(f"Method 3 (COM): {e3}")
+                    except Exception as e2:
+                        errors.append(f"Method 2: {e2}")
 
-            if not success:
-                root.after(0, log_status, f"Failed to convert: {os.path.basename(docx_path)}\n", "red")
+                if not success:
+                    try:
+                        import pythoncom
+                        pythoncom.CoInitialize()
+                        try:
+                            convert_func(safe_docx, tmp)
+                            shutil.move(safe_pdf, final_output)
+                            success = True
+                        finally:
+                            pythoncom.CoUninitialize()
+                    except Exception as e3:
+                        errors.append(f"Method 3 (COM): {e3}")
+
+            # Only successful conversions teach the time estimate
+            progress.advance(record=success)
+            if success:
+                root.after(0, log_status, f"Converted: {os.path.basename(docx_path)}\n", "green")
+            else:
+                failed += 1
+                root.after(0, log_status, f"Failed: {os.path.basename(docx_path)}\n", "red")
                 root.after(0, log_status, f"  Last error: {errors[-1]}\n", "red")
                 root.after(0, log_status, "  Try: close Word, run as admin, or check docx2pdf install\n", "blue")
+
+        finish_task(total, failed, "converted")
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -488,8 +706,9 @@ FONT_TITLE  = ("Segoe UI Semibold", 10)
 FONT_MONO   = ("Consolas", 9)
 
 root = tk.Tk()
+root.withdraw()  # hidden until the splash screen has finished loading
 root.title("The Ultimate PDF Tool 3000")
-root.geometry("820x900")
+root.minsize(820, 1)  # height follows the content (grows when Details is opened)
 root.resizable(True, True)
 root.configure(bg=BG)
 root.columnconfigure(0, weight=1)
@@ -567,6 +786,11 @@ style.configure("TScrollbar",
     borderwidth=0, arrowsize=12)
 style.map("TScrollbar", background=[("active", BORDER)])
 
+style.configure("Accent.Horizontal.TProgressbar",
+    troughcolor=SURFACE2, background=ACCENT,
+    bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT,
+    thickness=18)
+
 # --- Root layout ---
 main_frame = ttk.Frame(root, padding=18)
 main_frame.pack(fill="both", expand=True)
@@ -582,8 +806,10 @@ header.columnconfigure(0, weight=1)
 header_inner = tk.Frame(header, bg=BG)
 header_inner.pack(anchor="center")
 
+tk.Label(header_inner, text="🔥", bg=BG, font=("Segoe UI Emoji", 22)).pack(side="left")
 tk.Label(header_inner, text=" The Ultimate PDF Tool 3000 ", bg=BG, fg=ACCENT,
          font=("Segoe UI Black", 22, "bold")).pack(side="left")
+tk.Label(header_inner, text="💥", bg=BG, font=("Segoe UI Emoji", 22)).pack(side="left")
 
 # --- File Selection ---
 file_frame = ttk.LabelFrame(main_frame, text="DOCUMENTS", style="Card.TLabelframe", padding=14)
@@ -654,14 +880,83 @@ ttk.Button(main_frame, text="Clear Selection", command=clear_selection, style="D
     row=3, column=0, columnspan=3, pady=(0, 14), ipadx=20)
 
 # --- Status ---
-status_frame = ttk.LabelFrame(main_frame, text="LOG", style="Card.TLabelframe", padding=14)
+status_frame = ttk.LabelFrame(main_frame, text="STATUS", style="Card.TLabelframe", padding=14)
 status_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
 
-status_container = ttk.Frame(status_frame, style="Inner.TFrame")
+# Progress bar + percentage
+bar_row = ttk.Frame(status_frame, style="Inner.TFrame")
+bar_row.pack(fill="x")
+progress_bar = ttk.Progressbar(bar_row, orient="horizontal", mode="determinate",
+                               maximum=1000, style="Accent.Horizontal.TProgressbar")
+progress_bar.pack(side="left", fill="x", expand=True)
+percent_label = tk.Label(bar_row, text="0%", width=5, anchor="e",
+                         bg=SURFACE, fg=ACCENT, font=FONT_TITLE)
+percent_label.pack(side="right", padx=(8, 0))
+
+# Current step message + elapsed time
+msg_row = ttk.Frame(status_frame, style="Inner.TFrame")
+msg_row.pack(fill="x", pady=(6, 10))
+elapsed_label = tk.Label(msg_row, text="", bg=SURFACE, fg=FG_DIM, font=FONT_LABEL)
+elapsed_label.pack(side="right")
+message_label = tk.Label(msg_row, text="", anchor="w", justify="left", wraplength=640,
+                         bg=SURFACE, fg=FG_DIM, font=FONT_UI)
+message_label.pack(side="left", fill="x", expand=True)
+
+MESSAGE_COLORS = {"green": SUCCESS, "red": ERROR, "blue": INFO, "dim": FG_DIM}
+shown_fraction = [0.0]
+
+
+def animate_progress():
+    """Runs every 30 ms: eases the bar toward the tracker's value and updates the labels."""
+    target, message, color, elapsed = progress.snapshot()
+    shown = shown_fraction[0]
+    if target < shown - 0.5:
+        shown = 0.0                        # a new task started: restart from zero
+    shown += (target - shown) * 0.15       # smooth the jumps
+    if abs(target - shown) < 0.001:
+        shown = target
+    shown_fraction[0] = shown
+
+    progress_bar["value"] = shown * 1000
+    percent_label.config(text=f"{int(shown * 100)}%")
+    message_label.config(text=message, fg=MESSAGE_COLORS.get(color, FG))
+    elapsed_label.config(text=f"{int(elapsed) // 60}:{int(elapsed) % 60:02d}" if progress.busy or elapsed >= 1 else "")
+    root.after(30, animate_progress)
+
+
+# Log history, collapsed under a "Details" toggle
+details_toggle = tk.Label(status_frame, text="▸ Show details", cursor="hand2",
+                          bg=SURFACE, fg=ACCENT, font=FONT_LABEL)
+details_toggle.pack(anchor="w")
+details_frame = ttk.Frame(status_frame, style="Inner.TFrame")
+
+
+def details_visible():
+    return bool(details_frame.winfo_manager())  # packed (works even while the window is hidden)
+
+
+def set_details_visible(visible):
+    if visible == details_visible():
+        return
+    if visible:
+        details_frame.pack(fill="both", expand=True, pady=(8, 0))
+        details_toggle.config(text="▾ Hide details")
+    else:
+        details_frame.pack_forget()
+        details_toggle.config(text="▸ Show details")
+    # Keep the current width, only grow/shrink the height to fit
+    root.update_idletasks()
+    root.geometry(f"{root.winfo_width()}x{root.winfo_reqheight()}")
+
+
+details_toggle.bind("<Button-1>", lambda e: set_details_visible(not details_visible()))
+
+status_container = ttk.Frame(details_frame, style="Inner.TFrame")
 status_container.pack(fill="both", expand=True)
 
 status_text = tk.Text(
-    status_container, height=8, state=tk.DISABLED, wrap=tk.WORD,
+    status_container, height=6, width=1,  # width=1: fill the card, don't widen the window
+    state=tk.DISABLED, wrap=tk.WORD,
     font=FONT_MONO, bg=SURFACE2, fg=FG,
     relief="flat", borderwidth=0,
     highlightthickness=1, highlightbackground=BORDER, highlightcolor=BORDER,
@@ -675,15 +970,76 @@ status_text.tag_configure("green", foreground=SUCCESS)
 status_text.tag_configure("red",   foreground=ERROR)
 status_text.tag_configure("blue",  foreground=INFO)
 
-ttk.Button(status_frame, text="Clear Log", style="Ghost.TButton",
+ttk.Button(details_frame, text="Clear Log", style="Ghost.TButton",
            command=lambda: [status_text.config(state=tk.NORMAL),
                             status_text.delete(1.0, tk.END),
                             status_text.config(state=tk.DISABLED)]).pack(pady=(10, 0))
+
+
+# =============================================================================
+# SPLASH SCREEN
+# =============================================================================
+
+def show_splash():
+    """Borderless loading window shown while the libraries load; opens the main window when done."""
+    splash = tk.Toplevel(root)
+    splash.withdraw()  # shown once sized and centered
+    splash.overrideredirect(True)
+    splash.configure(bg=BG, highlightthickness=1, highlightbackground=BORDER)
+    splash.attributes("-topmost", True)
+
+    title = tk.Frame(splash, bg=BG)
+    title.pack(padx=40, pady=(32, 22))
+    tk.Label(title, text="🔥", bg=BG, font=("Segoe UI Emoji", 20)).pack(side="left")
+    tk.Label(title, text=" The Ultimate PDF Tool 3000 ", bg=BG, fg=ACCENT,
+             font=("Segoe UI Black", 20, "bold")).pack(side="left")
+    tk.Label(title, text="💥", bg=BG, font=("Segoe UI Emoji", 20)).pack(side="left")
+
+    bar = ttk.Progressbar(splash, orient="horizontal", mode="determinate", maximum=1000,
+                          style="Accent.Horizontal.TProgressbar")
+    bar.pack(fill="x", padx=40)
+    msg = tk.Label(splash, text="Libraries loaded - Ready to process!", bg=BG, fg=FG_DIM, font=FONT_UI)
+    msg.pack(pady=(10, 28))
+
+    # Size to content (the title scales with Windows display scaling), then center
+    splash.update_idletasks()
+    w, h = splash.winfo_reqwidth(), splash.winfo_reqheight()
+    splash.geometry(f"{w}x{h}+{(splash.winfo_screenwidth() - w) // 2}+{(splash.winfo_screenheight() - h) // 2}")
+    splash.deiconify()
+
+    shown = [0.0]
+
+    def open_main():
+        splash.destroy()
+        progress.reset("Ready - select documents and choose an operation")
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    def tick():
+        target, message, color, _ = progress.snapshot()
+        shown[0] += (target - shown[0]) * 0.15
+        if abs(target - shown[0]) < 0.001:
+            shown[0] = target
+        bar["value"] = shown[0] * 1000
+        msg.config(text=message, fg=MESSAGE_COLORS.get(color, FG))
+        if progress.finished and shown[0] >= target:
+            # Let "Ready" (or the error) be read for a moment
+            splash.after(700 if color == "green" else 2500, open_main)
+        else:
+            splash.after(30, tick)
+
+    tick()
+
 
 # =============================================================================
 # STARTUP
 # =============================================================================
 
-root.after(100, log_status, "Loading libraries in background...\n", "blue")
+log_status("Loading libraries in background...\n", "blue")
+# Started here (not in the thread) so the splash never sees an idle tracker
+progress.start(1, "Loading libraries in background...", key="load", default_est=4)
 threading.Thread(target=preload_libraries, daemon=True).start()
+show_splash()
+animate_progress()
 root.mainloop()
