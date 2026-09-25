@@ -28,14 +28,14 @@ pip install PyMuPDF docx2pdf pywin32
 ## Running the app
 
 ```bash
-python pdf_rescaler.py
+python MAIN.py
 ```
 
 ## Building the exe (Windows)
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --icon=your_icon.ico pdf_rescaler.py
+pyinstaller --onefile --windowed --icon=your_icon.ico MAIN.py
 ```
 
 The executable will be in the `dist/` folder.
